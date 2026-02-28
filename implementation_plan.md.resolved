@@ -1,0 +1,419 @@
+# Mission Control — Final Implementation Plan
+
+> **Goal**: Multi-company, multi-agent command center. Single pane of glass for businesses, agents, social media, leads, costs, and knowledge. Product-ready from day one.
+
+---
+
+## Tech Stack
+
+| Layer | Tech |
+|---|---|
+| **Framework** | Next.js 15 (App Router) + TypeScript |
+| **Database** | Supabase (Postgres + Realtime + Auth) |
+| **Styling** | Tailwind CSS v4 |
+| **Components** | shadcn/ui |
+| **Icons** | Lucide React (bundled with shadcn) |
+| **AI Models** | OpenRouter (unified gateway to all models) |
+| **Agent Comms** | OpenClaw Gateway — WebSocket on port `18789` |
+| **State** | React hooks + Supabase real-time subscriptions |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     MISSION CONTROL                      │
+│                    (Next.js 15 App)                       │
+│                                                          │
+│  ┌──────────────────┐  ┌──────────────────────────────┐  │
+│  │    FRONTEND       │  │    BACKEND (API Routes)      │  │
+│  │                   │  │                              │  │
+│  │  React pages      │  │  /api/agents/*     → WS mgmt│  │
+│  │  shadcn + TW v4   │  │  /api/workspaces/* → CRUD   │  │
+│  │  Client components│  │  /api/social/*     → posts   │  │
+│  │                   │  │  /api/models/*     → OR API  │  │
+│  │  Never touches    │  │  /api/costs/*      → finance │  │
+│  │  secrets directly │  │  /api/brain/*      → KB      │  │
+│  │                   │  │                              │  │
+│  │  Calls /api/*     │  │  Holds all secrets           │  │
+│  │  endpoints only   │  │  server-side only            │  │
+│  └──────────────────┘  └──────────┬───────────────────┘  │
+└──────────────────────────────────┬┼───────────────────────┘
+                                   ││
+                    ┌──────────────┘│
+                    ▼               ▼
+              ┌──────────┐   ┌──────────────────┐
+              │ Supabase  │   │ OpenClaw Gateway  │
+              │ (DB +     │   │ ws://host:18789   │
+              │ Realtime) │   │ (local Mac or     │
+              └──────────┘   │  Docker container) │
+                              └────────┬─────────┘
+                                       │
+                              ┌────────┴────────┐
+                              ▼                 ▼
+                       ┌───────────┐     ┌───────────┐
+                       │ OpenRouter │     │ Direct    │
+                       │ (models)   │     │ Provider  │
+                       └───────────┘     └───────────┘
+```
+
+### Why Next.js API Routes as the Backend
+
+> [!IMPORTANT]
+> We do **not** need a separate backend server. Next.js API routes (`/api/*`) run server-side and give us:
+
+- **Secret isolation** — Supabase service key, OpenRouter API key, device tokens never reach the browser
+- **Server-only DB access** — All Supabase mutations go through API routes using the service role key
+- **WebSocket management** — Agent connections are managed server-side
+- **API proxy** — OpenRouter calls, social platform APIs all proxied through our routes
+- **Middleware** — Request validation, rate limiting, auth checks at the edge
+
+The frontend is pure React client components that call these API routes. Zero secrets on the client.
+
+---
+
+## Security Architecture
+
+| Layer | How |
+|---|---|
+| **Supabase credentials** | `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env.local` — server-side only |
+| **OpenRouter API key** | Stored in `.env.local`, proxied via `/api/models/*` routes |
+| **OpenClaw device tokens** | Encrypted at rest in `agents` table. Decrypted server-side only when opening WebSocket |
+| **Social platform tokens** | Stored encrypted in `integrations` table. Used server-side only |
+| **Row Level Security (RLS)** | Enabled on all Supabase tables. Service role bypasses for API routes |
+| **Client auth** | For now: local-only (no auth needed). Later: Supabase Auth with JWT for multi-user/SaaS |
+| **CORS** | API routes only accept requests from `localhost:3000` in dev |
+
+> [!TIP]
+> When this becomes a product, we add Supabase Auth + RLS policies scoped to `auth.uid()`. The architecture doesn't change — we just swap the service key calls for user-scoped calls.
+
+---
+
+## OpenClaw Integration
+
+### How It Works
+
+```
+Mission Control                    OpenClaw Instance
+(Next.js API route)                (running on your Mac)
+       │                                  │
+       │── ws://localhost:18789 ──────────►│
+       │   { type: "pair", ... }          │
+       │◄─ { deviceToken: "abc..." } ─────│
+       │                                  │
+       │── { type: "command",             │
+       │     payload: "do X" } ──────────►│
+       │◄─ { type: "event",              │
+       │     data: { ... } } ─────────────│
+       │                                  │
+       │   Mission Control writes         │
+       │   events to Supabase             │
+       │   agent_activity table           │
+```
+
+### Deployment Model
+
+| Phase | OpenClaw runs | Mission Control runs |
+|---|---|---|
+| **Now** | Directly on Mac (`localhost:18789`) | Locally (`localhost:3000`) |
+| **Later (multi-agent)** | Multiple Docker containers on different ports | Still locally |
+| **Production** | Docker containers (any host) | Vercel / Railway / self-hosted |
+
+Mission Control connects to each agent by its host:port. For local Mac: `ws://localhost:18789`. For Docker: `ws://localhost:18790`, `18791`, etc. or remote hosts.
+
+---
+
+## Design System
+
+Tailwind CSS v4 with CSS-first configuration. shadcn/ui components styled to match the dark elevation system.
+
+| Token | Value | Usage |
+|---|---|---|
+| `--background` | `#121212` | Page background |
+| `--card` | `#1E1E1E` | Card surfaces |
+| `--sidebar` | `#0D0D0D` | Sidebar (deepest) |
+| `--muted` | `#252525` | Hover, inputs |
+| `--accent` | `#2A2A2A` | Elevated surfaces |
+| `--primary` | `#E5850F` | Orange — CTAs, agent tags |
+| `--info` | `#5A9CF5` | Blue — secondary, info |
+| `--success` | `#2ECC8F` | Green — online, complete |
+| `--destructive` | `#D95555` | Red — errors, danger |
+
+Text opacity: `0.87` primary → `0.60` body → `0.38` muted → `0.25` disabled. Borders over shadows. `fade-in` animations with stagger.
+
+---
+
+## Pages (9 + Settings)
+
+> [!IMPORTANT]
+> Every page is **operational**. Sophisticated, not overloaded.
+
+---
+
+### 1. 🏠 Command Center `/`
+
+| Element | Purpose |
+|---|---|
+| **Workspace summary cards** | One per company — agents, leads, tasks, spend |
+| **Agent fleet strip** | All agents: status, current task, workspace tag |
+| **Activity stream** | Real-time feed via Supabase subscriptions |
+| **⌘K Command palette** | Global quick actions |
+
+---
+
+### 2. 🤖 Agents `/agents`
+
+| Element | Purpose |
+|---|---|
+| **Agent cards** | Name, workspace, status, current task, model, uptime |
+| **Detail panel** | Live logs, task queue, memory, config |
+| **Direct command** | Send instructions via WebSocket |
+| **Agent actions** | Start / Stop / Restart / Reassign |
+| **Add agent** | Host, port, pair to get device token |
+
+---
+
+### 3. 🧠 Models & AI `/models`
+
+| Element | Purpose |
+|---|---|
+| **Model registry** | Browse OpenRouter models, filter by provider/cost |
+| **Agent-model mapping** | Default model per agent + complexity overrides |
+| **Complexity tiers** | Light / Standard / Heavy → each maps to a model |
+| **API keys** | OpenRouter key, or direct provider keys |
+| **Usage + balance** | Tokens per model, credit balance |
+
+---
+
+### 4. 📊 Projects `/projects`
+
+| Element | Purpose |
+|---|---|
+| **Workspace tabs** | Filter by company or "All" |
+| **Project cards** | Progress, agents, due date, task counts |
+| **Project detail** | Kanban columns, milestones, notes |
+| **Create project** | Modal with workspace + agent assignment |
+
+---
+
+### 5. 📱 Social & Leads `/social`
+
+| Element | Purpose |
+|---|---|
+| **Content calendar** | Scheduled/published posts across platforms |
+| **Post composer** | Write, select platforms, schedule. AI can draft |
+| **Engagement metrics** | Per-platform trends (7d/30d/90d) |
+| **Lead pipeline** | Kanban: New → Contacted → Qualified → Proposal → Won/Lost |
+| **Manual lead add** | LinkedIn initially, extensible |
+
+---
+
+### 6. 🧠 Knowledge Base `/brain`
+
+| Element | Purpose |
+|---|---|
+| **Scope toggle** | Workspace vs. Global |
+| **Quick add** | Text + URL + file drop |
+| **Search** | Full-text across all knowledge |
+| **Collections** | Grouped knowledge sets |
+
+---
+
+### 7. 💰 Finance & Costs `/costs`
+
+| Element | Purpose |
+|---|---|
+| **Cost overview** | Total spend, per workspace & agent, MoM change |
+| **Agent cost table** | Model, tokens, API cost per agent |
+| **Budget alerts** | Monthly limits, visual warnings |
+| **Cost timeline** | Trend chart with workspace toggle |
+| **Expense log** | Manual entries for subs, freelancers, ads |
+
+---
+
+### 8. 📈 Analytics `/analytics`
+
+| Element | Purpose |
+|---|---|
+| **Date range** | 7d / 30d / 90d / Custom |
+| **Agent performance** | Tasks, response times, error rates |
+| **Lead funnel** | Conversion rates per stage |
+| **Project velocity** | Tasks/week, on-track vs behind |
+| **Workspace comparison** | Side-by-side KPIs |
+
+---
+
+### 9. ⚙️ Settings `/settings`
+
+| Sub-section | Purpose |
+|---|---|
+| **Workspaces** | CRUD companies (dynamic, add anytime) |
+| **Agent config** | System prompt, model, memory per agent |
+| **Integrations** | Social platforms, external tools, status |
+| **Agent connections** | Host:port config (localhost now, Docker later) |
+| **Model pricing** | Cost-per-token for auto cost calculation |
+| **Security** | Manage encrypted tokens, rotate keys |
+
+---
+
+## Supabase Schema
+
+| Table | Purpose |
+|---|---|
+| `workspaces` | Companies — name, colour, description |
+| `agents` | Instances — host, port, encrypted_device_token, workspace_id, status |
+| `agent_activity` | Events — heartbeats, messages, tool calls, tokens_used |
+| `projects` | Projects scoped to workspaces |
+| `project_tasks` | Tasks — status, assignee, priority |
+| `social_accounts` | Connected platforms per workspace |
+| `social_posts` | Scheduled/published content |
+| `social_analytics` | Engagement metrics per post |
+| `leads` | Pipeline — source, stage, deal_value, workspace |
+| `knowledge_base` | Facts, notes, files, collection tags |
+| `bot_config` | Agent personality + settings |
+| `integrations` | Connected services + encrypted auth tokens |
+| `cost_entries` | Cost records — category, amount, workspace, agent |
+| `budgets` | Monthly limits per workspace/agent |
+| `model_config` | Model registry — provider, model_id, cost_per_token, tier |
+| `encryption_keys` | Key management for token encryption |
+
+---
+
+## Backend API Routes
+
+```
+/api/
+├── workspaces/
+│   ├── route.ts          # GET (list), POST (create)
+│   └── [id]/route.ts     # GET, PUT, DELETE
+├── agents/
+│   ├── route.ts          # GET (list), POST (register + pair)
+│   ├── [id]/route.ts     # GET, PUT, DELETE
+│   ├── [id]/command/route.ts   # POST — send instruction via WS
+│   └── [id]/logs/route.ts      # GET — stream activity
+├── models/
+│   ├── route.ts          # GET available models (proxy OpenRouter)
+│   ├── config/route.ts   # GET/PUT agent-model mappings
+│   └── usage/route.ts    # GET token usage + credit balance
+├── projects/
+│   ├── route.ts          # CRUD
+│   └── [id]/tasks/route.ts
+├── social/
+│   ├── posts/route.ts    # CRUD + schedule
+│   ├── accounts/route.ts # Connect/disconnect platforms
+│   └── analytics/route.ts
+├── leads/route.ts        # CRUD + pipeline stage updates
+├── brain/route.ts        # CRUD knowledge entries
+├── costs/
+│   ├── route.ts          # GET cost data + POST manual entries
+│   └── budgets/route.ts  # GET/PUT budget limits
+└── analytics/route.ts    # GET aggregated metrics
+```
+
+All routes use `SUPABASE_SERVICE_ROLE_KEY` server-side. No secrets exposed to the client.
+
+---
+
+## Product-Ready Notes
+
+> [!NOTE]
+> Built for future SaaS conversion:
+
+- **Multi-tenancy** — workspace isolation, natural path to user teams
+- **Config-driven integrations** — nothing hardcoded
+- **OpenRouter default** — one credit pool, all models
+- **Pluggable agent protocol** — OpenClaw today, extendable
+- **shadcn/ui** — professional component library, easy to theme and white-label
+- **Server-side security** — secrets never touch the browser
+
+---
+
+## 🚀 Build Order
+
+| Phase | What | Why this order |
+|---|---|---|
+| **1** | **Scaffold** | `create-next-app`, Tailwind v4, shadcn init, design tokens |
+| **2** | **Backend foundation** | Supabase client (server), `.env.local`, base API route helpers |
+| **3** | **Sidebar + Layout + Workspace Switcher** | The shell — everything hangs off this |
+| **4** | **Settings** | CRUD workspaces + agent connection config |
+| **5** | **Agents + Gateway** | WebSocket client, pair with local OpenClaw, prove connectivity |
+| **6** | **Models & AI** | OpenRouter integration, agent-model config |
+| **7** | **Command Center** | Unified overview with live data |
+| **8** | **Projects** | Core operational capability |
+| **9** | **Social & Leads** | Revenue operations |
+| **10** | **Finance & Costs** | Spending visibility |
+| **11** | **Analytics** | Cross-company insights |
+| **12** | **Knowledge Base** | Second brain |
+
+> [!IMPORTANT]
+> **Phases 1–5 establish the gateway.** Scaffold → backend → shell → config → agent connection. Once an agent talks back, everything else is data flowing through that pipe.
+
+---
+
+## File Structure
+
+```
+mission-control/
+├── public/
+│   └── logo.png
+├── src/
+│   ├── app/
+│   │   ├── globals.css              # Tailwind v4 + design tokens
+│   │   ├── layout.tsx               # Root layout with sidebar
+│   │   ├── page.tsx                 # Command Center
+│   │   ├── agents/page.tsx
+│   │   ├── models/page.tsx
+│   │   ├── projects/page.tsx
+│   │   ├── social/page.tsx
+│   │   ├── brain/page.tsx
+│   │   ├── costs/page.tsx
+│   │   ├── analytics/page.tsx
+│   │   ├── settings/page.tsx
+│   │   └── api/                     # ← THE BACKEND
+│   │       ├── workspaces/
+│   │       ├── agents/
+│   │       ├── models/
+│   │       ├── projects/
+│   │       ├── social/
+│   │       ├── leads/
+│   │       ├── brain/
+│   │       ├── costs/
+│   │       └── analytics/
+│   ├── components/                  # shadcn + custom
+│   │   ├── ui/                      # shadcn components
+│   │   ├── Sidebar.tsx
+│   │   ├── CommandPalette.tsx
+│   │   └── WorkspaceSwitcher.tsx
+│   └── lib/
+│       ├── supabase-server.ts       # Service role client (server only)
+│       ├── supabase-client.ts       # Anon client (realtime subscriptions)
+│       ├── gateway.ts               # OpenClaw WebSocket client
+│       ├── openrouter.ts            # OpenRouter API client
+│       └── encryption.ts            # Token encryption utilities
+├── .env.local                       # All secrets here
+├── components.json                  # shadcn config
+├── package.json
+├── tsconfig.json
+└── next.config.ts
+```
+
+---
+
+## Verification Plan
+
+### Automated
+- `npm run build` — zero errors
+- `npm run lint` — clean
+
+### Browser Testing
+- All pages render with dark mode
+- Workspace switcher filters data
+- CRUD on workspaces, projects, leads, knowledge
+- ⌘K command palette from every page
+- Agent WebSocket connection (local OpenClaw)
+
+### Security Check
+- Verify no secrets in client bundle (`next build` + inspect)
+- API routes reject requests without proper headers
+- Encrypted tokens in Supabase are not readable via client
