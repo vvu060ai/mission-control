@@ -1,3 +1,14 @@
+/**
+ * GET  /api/models  — List OpenRouter models + current primary model
+ * POST /api/models  — Set the primary model in openclaw.json (writes via GatewayHub RPC or direct file)
+ *
+ * Model formats:
+ *   OpenRouter model IDs:  "google/gemini-2.0-flash-001"  (from OpenRouter /models API)
+ *   OpenClaw model refs:   "openrouter/google/gemini-2.0-flash-001"  (prefixed for openclaw.json)
+ *
+ * The UI and OpenRouter API use the bare OpenRouter ID.
+ * openclaw.json always uses the "openrouter/<id>" prefixed form.
+ */
 import { NextRequest, NextResponse } from 'next/server';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -5,7 +16,7 @@ import os from 'node:os';
 
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 
-function readOpenClawConfig(): Record<string, any> {
+function readOpenClawConfig(): Record<string, unknown> {
     try {
         return JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8'));
     } catch {
@@ -13,19 +24,27 @@ function readOpenClawConfig(): Record<string, any> {
     }
 }
 
-function writeOpenClawConfig(config: Record<string, any>) {
+function writeOpenClawConfig(config: Record<string, unknown>) {
     fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
-/**
- * GET /api/models
- * Returns list of available OpenRouter models + the currently active model
- */
+/** Strips "openrouter/" prefix → raw OpenRouter model ID for display / OpenRouter API calls */
+function toOpenRouterModelId(ref: string): string {
+    return ref.startsWith('openrouter/') ? ref.slice('openrouter/'.length) : ref;
+}
+
+/** Adds "openrouter/" prefix → openclaw.json compatible ref */
+function toOpenClawRef(modelId: string): string {
+    return modelId.startsWith('openrouter/') ? modelId : `openrouter/${modelId}`;
+}
+
+// ── GET ────────────────────────────────────────────────────────────────────────
+
 export async function GET() {
     const apiKey = process.env.OPENROUTER_API_KEY;
 
     if (!apiKey) {
-        return NextResponse.json({ error: 'OPENROUTER_API_KEY not configured' }, { status: 500 });
+        return NextResponse.json({ error: 'OPENROUTER_API_KEY not configured in .env.local' }, { status: 500 });
     }
 
     try {
@@ -43,65 +62,81 @@ export async function GET() {
         }
 
         const data = await res.json();
-
-        // Read current model from openclaw.json
         const config = readOpenClawConfig();
-        const currentModel: string = config?.agents?.defaults?.model?.primary || 'google/gemini-3-flash-preview';
+        const agents = config.agents as Record<string, unknown> | undefined;
+        const defaults = agents?.defaults as Record<string, unknown> | undefined;
+        const modelCfg = defaults?.model as Record<string, unknown> | undefined;
+
+        // Current primary is stored as "openrouter/google/gemini-2.0-flash-001"
+        // → return as bare "google/gemini-2.0-flash-001" for the UI
+        const rawPrimary = (modelCfg?.primary as string | undefined) ?? '';
+        const currentModel = toOpenRouterModelId(rawPrimary);
 
         return NextResponse.json({
-            models: data.data || [],
+            models: data.data ?? [],
             currentModel,
         });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message || 'Failed to fetch models' }, { status: 500 });
+    } catch (err: unknown) {
+        return NextResponse.json({ error: err instanceof Error ? err.message : 'Failed to fetch models' }, { status: 500 });
     }
 }
 
-/**
- * POST /api/models
- * Body: { model: string }
- * Updates the primary model in openclaw.json and returns success
- */
+// ── POST ───────────────────────────────────────────────────────────────────────
+
 export async function POST(req: NextRequest) {
     try {
-        const { model } = await req.json();
+        const { model } = await req.json() as { model?: string };
+
         if (!model || typeof model !== 'string') {
             return NextResponse.json({ error: 'Missing or invalid model field' }, { status: 400 });
         }
 
-        const config = readOpenClawConfig();
+        const apiKey = process.env.OPENROUTER_API_KEY;
+        const openClawRef = toOpenClawRef(model); // "openrouter/google/gemini-2.0-flash-001"
+        const config = readOpenClawConfig() as Record<string, unknown>;
 
-        // Ensure the nested structure exists
+        // ── Ensure nested structure ──
         if (!config.agents) config.agents = {};
-        if (!config.agents.defaults) config.agents.defaults = {};
-        if (!config.agents.defaults.model) config.agents.defaults.model = {};
-        if (!config.agents.defaults.models) config.agents.defaults.models = {};
+        const agents = config.agents as Record<string, unknown>;
+        if (!agents.defaults) agents.defaults = {};
+        const defaults = agents.defaults as Record<string, unknown>;
+        if (!defaults.model) defaults.model = {};
+        const modelCfg = defaults.model as Record<string, unknown>;
+        if (!defaults.models) defaults.models = {};
+        const allowlist = defaults.models as Record<string, unknown>;
 
-        // Set the primary model
-        const previousModel = config.agents.defaults.model.primary;
-        config.agents.defaults.model.primary = model;
+        // ── Set primary model (with openrouter/ prefix) ──
+        const previousRef = modelCfg.primary as string | undefined;
+        modelCfg.primary = openClawRef;
 
-        // Keep the models map in sync (add the new model if it doesn't exist)
-        if (!config.agents.defaults.models[model]) {
-            config.agents.defaults.models[model] = {};
+        // ── Add to allowlist (openrouter/ prefixed) ──
+        if (!allowlist[openClawRef]) {
+            allowlist[openClawRef] = {};
         }
 
-        // Update meta
-        config.meta = {
-            ...(config.meta || {}),
-            lastTouchedAt: new Date().toISOString(),
-            lastTouchedBy: 'mission-control',
-        };
+        // ── Ensure OPENROUTER_API_KEY is in the config env ──
+        // This lets the OpenClaw agent call OpenRouter for tasks/tools,
+        // separate from Mission Control's direct API calls.
+        if (apiKey) {
+            if (!config.env) config.env = {};
+            const envCfg = config.env as Record<string, string>;
+            if (!envCfg.OPENROUTER_API_KEY) {
+                envCfg.OPENROUTER_API_KEY = apiKey;
+            }
+        }
 
+        // ── Write config (no meta fields — openclaw rejects unknown keys) ──
         writeOpenClawConfig(config);
 
         return NextResponse.json({
             success: true,
-            previousModel,
-            currentModel: model,
-            message: `Model updated to ${model}`,
+            previousModel: previousRef ? toOpenRouterModelId(previousRef) : null,
+            currentModel: model,        // bare ID for the UI
+            openClawRef,                // prefixed ref written to openclaw.json
+            message: `Model updated to ${openClawRef} in openclaw.json`,
+            note: 'agents.* changes are hot-reloaded — no gateway restart needed.',
         });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message || 'Failed to update model' }, { status: 500 });
+    } catch (err: unknown) {
+        return NextResponse.json({ error: err instanceof Error ? err.message : 'Failed to update model' }, { status: 500 });
     }
 }

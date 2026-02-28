@@ -191,9 +191,8 @@ export default function Chat({ connections }: { connections: Connection[] }) {
                     gatewayUrl: selectedConnection.url,
                     token: selectedConnection.token,
                     agentId: selectedConnection.agentId,
-                    messages: [...messages, userMessage].slice(-10),
-                    // Pass the selected OpenRouter model — server routes to OR when this is set
-                    openrouterModel: selectedModel || undefined,
+                    // Full history — OpenClaw manages its own context window compression
+                    messages: [...messages, userMessage],
                 })
             });
 
