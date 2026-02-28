@@ -81,3 +81,4 @@ export async function POST(req: NextRequest) {
         return new Response(JSON.stringify({ error: message }), { status: 500 });
     }
 }
+console.log("TESTING");

@@ -240,6 +240,9 @@ export class GatewayConnection extends EventEmitter {
                         payload: msg.payload,
                         seq: ++this.seq,
                     };
+                    try {
+                        fs.appendFileSync('/tmp/mission-control-events.log', JSON.stringify(evt) + '\n');
+                    } catch (e) { }
                     this.emit('gateway-event', evt);
                 }
 

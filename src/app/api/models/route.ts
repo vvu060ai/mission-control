@@ -40,7 +40,9 @@ function toOpenClawRef(modelId: string): string {
 
 // ── GET ────────────────────────────────────────────────────────────────────────
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+    const url = new URL(req.url);
+    const agentId = url.searchParams.get('agentId') || 'main';
     const apiKey = process.env.OPENROUTER_API_KEY;
 
     if (!apiKey) {
@@ -63,14 +65,25 @@ export async function GET() {
 
         const data = await res.json();
         const config = readOpenClawConfig();
-        const agents = config.agents as Record<string, unknown> | undefined;
-        const defaults = agents?.defaults as Record<string, unknown> | undefined;
-        const modelCfg = defaults?.model as Record<string, unknown> | undefined;
 
-        // Current primary is stored as "openrouter/google/gemini-2.0-flash-001"
-        // → return as bare "google/gemini-2.0-flash-001" for the UI
-        const rawPrimary = (modelCfg?.primary as string | undefined) ?? '';
-        const currentModel = toOpenRouterModelId(rawPrimary);
+        let rawModel = '';
+
+        if (agentId !== 'main' && (config.agents as any)?.list) {
+            const agent = (config.agents as any).list.find((a: any) => a.id === agentId);
+            if (agent && agent.model) {
+                rawModel = agent.model;
+            }
+        }
+
+        // Fallback to global default
+        if (!rawModel) {
+            const agents = config.agents as Record<string, unknown> | undefined;
+            const defaults = agents?.defaults as Record<string, unknown> | undefined;
+            const modelCfg = defaults?.model as Record<string, unknown> | undefined;
+            rawModel = (modelCfg?.primary as string | undefined) ?? '';
+        }
+
+        const currentModel = toOpenRouterModelId(rawModel);
 
         return NextResponse.json({
             models: data.data ?? [],
@@ -85,7 +98,9 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
     try {
-        const { model } = await req.json() as { model?: string };
+        const body = await req.json();
+        const model = body.model as string;
+        const agentId = body.agentId as string | undefined;
 
         if (!model || typeof model !== 'string') {
             return NextResponse.json({ error: 'Missing or invalid model field' }, { status: 400 });
@@ -105,9 +120,23 @@ export async function POST(req: NextRequest) {
         if (!defaults.models) defaults.models = {};
         const allowlist = defaults.models as Record<string, unknown>;
 
-        // ── Set primary model (with openrouter/ prefix) ──
-        const previousRef = modelCfg.primary as string | undefined;
-        modelCfg.primary = openClawRef;
+        let previousRef: string | undefined;
+
+        // ── Set per-agent OR primary model (with openrouter/ prefix) ──
+        if (agentId && agentId !== 'main') {
+            if (!agents.list) agents.list = [];
+            const agentList = agents.list as any[];
+            const agentEntry = agentList.find(a => a.id === agentId);
+            if (agentEntry) {
+                previousRef = agentEntry.model;
+                agentEntry.model = openClawRef;
+            } else {
+                return NextResponse.json({ error: `Agent ${agentId} not found` }, { status: 404 });
+            }
+        } else {
+            previousRef = modelCfg.primary as string | undefined;
+            modelCfg.primary = openClawRef;
+        }
 
         // ── Add to allowlist (openrouter/ prefixed) ──
         if (!allowlist[openClawRef]) {

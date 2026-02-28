@@ -1,13 +1,19 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Send, User, Bot, Loader2, MessageSquare, Shield, ChevronDown, Zap, Search, Check } from "lucide-react";
+import { Send, User, Bot, Loader2, MessageSquare, Shield, ChevronDown, Zap, Search, Check, Plus } from "lucide-react";
 
 interface Message {
     id: string;
     role: 'user' | 'assistant';
     content: string;
     timestamp: number;
+}
+
+export interface AgentPersona {
+    id: string;
+    name: string;
+    model: string;
 }
 
 interface Connection {
@@ -41,6 +47,10 @@ export default function Chat({ connections }: { connections: Connection[] }) {
     const [isLoading, setIsLoading] = useState(false);
     const [selectedConnection, setSelectedConnection] = useState<Connection | null>(connections[0] || null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const [gatewayAgents, setGatewayAgents] = useState<Record<string, AgentPersona[]>>({});
+
+    // Real-time agent thought tracking
+    const [activeThought, setActiveThought] = useState<{ icon: string, text: string } | null>(null);
 
     // Model selector state
     const [models, setModels] = useState<OpenRouterModel[]>([]);
@@ -106,7 +116,10 @@ export default function Chat({ connections }: { connections: Connection[] }) {
             const res = await fetch('/api/models', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: modelId }),
+                body: JSON.stringify({
+                    model: modelId,
+                    agentId: selectedConnection?.agentId
+                }),
             });
             const data = await res.json();
             if (data.success) {
@@ -122,6 +135,23 @@ export default function Chat({ connections }: { connections: Connection[] }) {
         }
     };
 
+    // When connection/agentId changes, fetch the current model
+    useEffect(() => {
+        const fetchCurrentAgentModel = async () => {
+            if (!selectedConnection) return;
+            try {
+                const res = await fetch(`/api/models?agentId=${encodeURIComponent(selectedConnection.agentId)}`);
+                const data = await res.json();
+                if (data.currentModel) {
+                    setSelectedModel(data.currentModel);
+                }
+            } catch (e) {
+                console.error("Failed to fetch agent model", e);
+            }
+        };
+        fetchCurrentAgentModel();
+    }, [selectedConnection?.agentId]);
+
     const filteredModels = models.filter(m =>
         m.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
         m.name.toLowerCase().includes(modelSearch.toLowerCase())
@@ -129,13 +159,33 @@ export default function Chat({ connections }: { connections: Connection[] }) {
 
     const selectedModelInfo = models.find(m => m.id === selectedModel);
 
+    const fetchAgents = useCallback(async () => {
+        const newGatewayAgents: Record<string, AgentPersona[]> = {};
+        for (const conn of connections) {
+            try {
+                const res = await fetch(`/api/agents?gatewayUrl=${encodeURIComponent(conn.url)}&token=${encodeURIComponent(conn.token)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    newGatewayAgents[conn.url] = data.agents;
+                }
+            } catch (e) {
+                console.error("Failed to fetch agents:", e);
+            }
+        }
+        setGatewayAgents(newGatewayAgents);
+    }, [connections]);
+
+    useEffect(() => {
+        fetchAgents();
+    }, [fetchAgents]);
+
     useEffect(() => {
         if (!selectedConnection && connections.length > 0) {
             setSelectedConnection(connections[0]);
         }
 
         if (selectedConnection) {
-            const saved = localStorage.getItem(`mission_control_msgs_${selectedConnection.url}`);
+            const saved = localStorage.getItem(`mission_control_msgs_${selectedConnection.url}_${selectedConnection.agentId}`);
             if (saved) {
                 try {
                     setMessages(JSON.parse(saved));
@@ -150,13 +200,121 @@ export default function Chat({ connections }: { connections: Connection[] }) {
 
     useEffect(() => {
         if (selectedConnection && messages.length > 0) {
-            localStorage.setItem(`mission_control_msgs_${selectedConnection.url}`, JSON.stringify(messages));
+            localStorage.setItem(`mission_control_msgs_${selectedConnection.url}_${selectedConnection.agentId}`, JSON.stringify(messages));
         }
     }, [messages, selectedConnection]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [messages]);
+    }, [messages, activeThought]);
+
+    // Track active agent background processes via SSE
+    useEffect(() => {
+        if (!selectedConnection) {
+            setActiveThought(null);
+            return;
+        }
+
+        const url = `/api/gateway/events?gateways=${encodeURIComponent(selectedConnection.url)}&token=${encodeURIComponent(selectedConnection.token)}`;
+        const es = new EventSource(url);
+
+        es.addEventListener('gateway-event', (e) => {
+            try {
+                const evt = JSON.parse(e.data);
+                // The gateway emits events like agent.tool_call, agent.step, agent.output
+                if (evt.event === 'agent.step') {
+                    setActiveThought({ icon: '🧠', text: 'Analyzing request...' });
+                } else if (evt.event === 'agent.tool_call') {
+                    let toolName = '?';
+                    if (typeof evt.payload?.tool === 'string') {
+                        toolName = evt.payload.tool;
+                    } else if (evt.payload?.tool?.name) {
+                        toolName = evt.payload.tool.name;
+                    }
+                    setActiveThought({ icon: '🔧', text: `Using tool: ${toolName}` });
+                } else if (evt.event === 'agent.tool_result') {
+                    setActiveThought({ icon: '✅', text: `Tool returned data` });
+                } else if (evt.event === 'agent.error') {
+                    setActiveThought({ icon: '❌', text: 'Encountered error, checking paths...' });
+                } else if (evt.event === 'agent.output') {
+                    // Start of text generation
+                    setActiveThought(null);
+                }
+            } catch (err) { }
+        });
+
+        return () => {
+            es.close();
+            setActiveThought(null);
+        };
+    }, [selectedConnection]);
+
+    const handleShareContext = async () => {
+        if (!selectedConnection) return;
+        const newId = prompt("Enter new agent ID (e.g. data_analyst):");
+        if (!newId) return;
+        const newName = prompt("Enter new agent name:");
+        if (!newName) return;
+
+        setIsLoading(true);
+        try {
+            const res = await fetch('/api/agents', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    gatewayUrl: selectedConnection.url,
+                    token: selectedConnection.token,
+                    id: newId,
+                    name: newName,
+                    model: selectedModel || 'openrouter/auto'
+                })
+            });
+
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed");
+
+            // Copy messages to new agent's local storage
+            const newStorageKey = `mission_control_msgs_${selectedConnection.url}_${newId}`;
+            localStorage.setItem(newStorageKey, JSON.stringify(messages));
+
+            await fetchAgents();
+            setSelectedConnection({ ...selectedConnection, agentId: newId });
+        } catch (e: any) {
+            alert("Failed to spawn subagent: " + e.message);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleCreateAgent = async (conn: Connection) => {
+        const newId = prompt("Enter new agent ID (e.g. researcher):");
+        if (!newId) return;
+        const newName = prompt(`Enter a name for the agent '${newId}':`);
+        if (!newName) return;
+
+        setIsLoading(true);
+        try {
+            const res = await fetch('/api/agents', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: newId,
+                    name: newName,
+                    model: selectedModel || 'openrouter/auto'
+                })
+            });
+
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed");
+
+            await fetchAgents();
+            setSelectedConnection({ ...conn, agentId: newId });
+        } catch (e: any) {
+            alert("Failed to create agent: " + e.message);
+        } finally {
+            setIsLoading(false);
+        }
+    };
 
     const handleSend = async (e?: React.FormEvent) => {
         e?.preventDefault();
@@ -224,6 +382,8 @@ export default function Chat({ connections }: { connections: Connection[] }) {
                                         msg.id === assistantMsgId ? { ...msg, content: fullContent } : msg
                                     )
                                 );
+                                // As soon as text generation begins, clear the thinking state
+                                setActiveThought(null);
                             }
                         } catch (e) { }
                     }
@@ -232,18 +392,17 @@ export default function Chat({ connections }: { connections: Connection[] }) {
         };
 
         try {
+            setActiveThought({ icon: '🚀', text: 'Initializing...' });
             await executeChat();
         } catch (error: any) {
-            console.error("Chat error:", error);
             setMessages((prev) =>
                 prev.map((msg) =>
-                    msg.id === assistantMsgId
-                        ? { ...msg, content: `Error: ${error.message}` }
-                        : msg
+                    msg.id === assistantMsgId ? { ...msg, content: `[Error communicating with gateway: ${error.message}]` } : msg
                 )
             );
         } finally {
             setIsLoading(false);
+            setActiveThought(null);
         }
     };
 
@@ -379,27 +538,46 @@ export default function Chat({ connections }: { connections: Connection[] }) {
                     <div className="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar">
                         {connections.length === 0 ? (
                             <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800 text-slate-500 text-xs text-center border-dashed">
-                                No agents connected.
+                                No gateways connected.
                             </div>
                         ) : (
-                            connections.map((conn) => (
-                                <button
-                                    key={conn.url}
-                                    onClick={() => setSelectedConnection(conn)}
-                                    className={`p-4 rounded-2xl border transition-all text-left flex items-center gap-3 group ${selectedConnection?.url === conn.url
-                                        ? 'bg-orange-600/10 border-orange-500/50 text-white shadow-lg shadow-orange-950/10'
-                                        : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:border-slate-700 hover:bg-slate-900/60'
-                                        }`}
-                                >
-                                    <div className={`p-2 rounded-lg ${selectedConnection?.url === conn.url ? 'bg-orange-600 text-white' : 'bg-slate-800 text-slate-400 group-hover:text-white transition-colors'}`}>
-                                        <Bot size={18} />
+                            connections.map((conn) => {
+                                const agents = gatewayAgents[conn.url] || [{ id: 'main', name: 'Main Agent', model: '' }];
+                                return (
+                                    <div key={conn.url} className="mb-4">
+                                        <div className="flex items-center justify-between mb-2 pl-2 pr-1">
+                                            <div className="text-[10px] text-slate-600 font-mono truncate">{conn.url}</div>
+                                            <button
+                                                onClick={() => handleCreateAgent(conn)}
+                                                className="p-1 rounded bg-slate-800/50 text-slate-400 hover:text-white hover:bg-orange-500/20 transition-colors"
+                                                title="Create New Agent Persona"
+                                            >
+                                                <Plus size={12} />
+                                            </button>
+                                        </div>
+                                        <div className="flex flex-col gap-2">
+                                            {agents.map((agent: AgentPersona) => (
+                                                <button
+                                                    key={`${conn.url}-${agent.id}`}
+                                                    onClick={() => setSelectedConnection({ ...conn, agentId: agent.id })}
+                                                    className={`p-3 rounded-2xl border transition-all text-left flex items-center gap-3 group ${selectedConnection?.url === conn.url && selectedConnection?.agentId === agent.id
+                                                        ? 'bg-orange-600/10 border-orange-500/50 text-white shadow-lg shadow-orange-950/10'
+                                                        : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:border-slate-700 hover:bg-slate-900/60'
+                                                        }`}
+                                                >
+                                                    <div className={`p-2 rounded-lg ${selectedConnection?.url === conn.url && selectedConnection?.agentId === agent.id ? 'bg-orange-600 text-white' : 'bg-slate-800 text-slate-400 group-hover:text-white transition-colors'}`}>
+                                                        <Bot size={16} />
+                                                    </div>
+                                                    <div className="overflow-hidden">
+                                                        <p className="font-bold text-sm truncate uppercase tracking-tight">{agent.name || agent.id}</p>
+                                                        <p className="text-[10px] opacity-60 font-mono truncate">ID: {agent.id}</p>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
                                     </div>
-                                    <div className="overflow-hidden">
-                                        <p className="font-bold text-sm truncate uppercase tracking-tight">{conn.agentId}</p>
-                                        <p className="text-[10px] opacity-60 font-mono truncate">{conn.url}</p>
-                                    </div>
-                                </button>
-                            ))
+                                );
+                            })
                         )}
                     </div>
                 </aside>
@@ -433,9 +611,17 @@ export default function Chat({ connections }: { connections: Connection[] }) {
                             </div>
                         </div>
                         {selectedConnection && (
-                            <div className="px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center gap-2 group cursor-help">
-                                <Shield size={12} className="text-emerald-500" />
-                                <span className="text-[10px] font-bold text-emerald-500/80 uppercase">Secured</span>
+                            <div className="flex items-center gap-3">
+                                <button
+                                    onClick={handleShareContext}
+                                    className="px-3 py-1.5 rounded-full bg-violet-500/10 hover:bg-violet-500/20 border border-violet-500/20 text-[10px] font-bold text-violet-400 Transition-all uppercase flex items-center gap-2"
+                                >
+                                    Share Context
+                                </button>
+                                <div className="px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center gap-2 group cursor-help">
+                                    <Shield size={12} className="text-emerald-500" />
+                                    <span className="text-[10px] font-bold text-emerald-500/80 uppercase">Secured</span>
+                                </div>
                             </div>
                         )}
                     </div>
@@ -463,11 +649,25 @@ export default function Chat({ connections }: { connections: Connection[] }) {
                                         {msg.role === 'user' ? <User size={18} /> : <Bot size={18} />}
                                     </div>
                                     <div className={`flex flex-col max-w-[80%] ${msg.role === 'user' ? 'items-end' : ''}`}>
-                                        <div className={`px-5 py-3 rounded-2xl text-sm leading-relaxed ${msg.role === 'user'
+                                        <div className={`px-5 py-4 rounded-2xl text-sm leading-relaxed ${msg.role === 'user'
                                             ? 'bg-blue-600/10 border border-blue-500/30 text-white bubble-user'
                                             : 'bg-slate-800/50 border border-slate-700/50 text-slate-200 bubble-bot'
                                             }`}>
-                                            {msg.content || (isLoading && <Loader2 className="animate-spin text-slate-500" size={18} />)}
+
+                                            {msg.content}
+
+                                            {/* Process / Thought Indicator for active assistant messages */}
+                                            {msg.role === 'assistant' && isLoading && msg.id === messages[messages.length - 1].id && (
+                                                <div className={`flex items-center gap-3 ${msg.content ? 'mt-4 pt-4 border-t border-slate-700/50' : ''}`}>
+                                                    <Loader2 className="animate-spin text-orange-500 flex-shrink-0" size={16} />
+                                                    {activeThought && (
+                                                        <div className="flex items-center gap-2 text-orange-400 font-mono text-[11px] uppercase tracking-wider animate-pulse bg-orange-500/10 px-3 py-1.5 rounded-lg border border-orange-500/20">
+                                                            <span>{activeThought.icon}</span>
+                                                            <span>{activeThought.text}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                         <span className="text-[10px] font-bold text-slate-600 uppercase mt-2 px-1">
                                             {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
